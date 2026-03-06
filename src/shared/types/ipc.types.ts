@@ -78,9 +78,14 @@ export interface AgentsDeletePayload {
 
 // ── Runner IPC payloads ───────────────────────────────────────────────────────
 
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
 export interface RunnerStartPayload {
   agentId: string
-  userMessage: string
+  messages: ChatMessage[]
   runId: string
 }
 

@@ -6,6 +6,10 @@ const Database = require("better-sqlite3");
 const fs = require("fs");
 const uuid = require("uuid");
 const zod = require("zod");
+const ai = require("ai");
+const anthropic = require("@ai-sdk/anthropic");
+const openai = require("@ai-sdk/openai");
+const openaiCompatible = require("@ai-sdk/openai-compatible");
 let db = null;
 const MIGRATIONS = [
   // Migration 1: initial schema
@@ -124,17 +128,24 @@ const IPC_CHANNELS = {
 };
 const AnthropicProviderSchema = zod.z.object({
   provider: zod.z.literal("anthropic"),
-  model: zod.z.string().default("claude-opus-4-6"),
-  apiKeyRef: zod.z.string().min(1, "API key reference is required"),
+  model: zod.z.string().default("claude-haiku-4-5-20251001"),
+  apiKeyRef: zod.z.string().default("anthropic_api_key"),
   maxTokens: zod.z.number().int().positive().default(4096),
   temperature: zod.z.number().min(0).max(1).default(0.7)
 });
 const OpenAIProviderSchema = zod.z.object({
   provider: zod.z.literal("openai"),
   model: zod.z.string().default("gpt-4o"),
-  apiKeyRef: zod.z.string().min(1, "API key reference is required"),
+  apiKeyRef: zod.z.string().default("openai_api_key"),
   baseUrl: zod.z.string().url().optional(),
   // For Azure or custom OpenAI endpoints
+  maxTokens: zod.z.number().int().positive().default(4096),
+  temperature: zod.z.number().min(0).max(1).default(0.7)
+});
+const GeminiProviderSchema = zod.z.object({
+  provider: zod.z.literal("gemini"),
+  model: zod.z.string().default("gemini-2.0-flash"),
+  apiKeyRef: zod.z.string().default("gemini_api_key"),
   maxTokens: zod.z.number().int().positive().default(4096),
   temperature: zod.z.number().min(0).max(1).default(0.7)
 });
@@ -157,13 +168,14 @@ const CustomProviderSchema = zod.z.object({
 const ProviderConfigSchema = zod.z.discriminatedUnion("provider", [
   AnthropicProviderSchema,
   OpenAIProviderSchema,
+  GeminiProviderSchema,
   OllamaProviderSchema,
   CustomProviderSchema
 ]);
 const DEFAULT_PROVIDER = {
-  provider: "anthropic",
-  model: "claude-opus-4-6",
-  apiKeyRef: "",
+  provider: "gemini",
+  model: "gemini-2.0-flash",
+  apiKeyRef: "gemini_api_key",
   maxTokens: 4096,
   temperature: 0.7
 };
@@ -812,6 +824,17 @@ function registerSettingsIpc() {
               error: `HTTP ${response.status}`
             });
           }
+        } else if (payload.provider === "gemini") {
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+          );
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            return ok$2({
+              success: false,
+              error: body.error?.message || `HTTP ${response.status}`
+            });
+          }
         } else if (payload.provider === "ollama") {
           const response = await fetch("http://localhost:11434/api/tags").catch(
             () => null
@@ -908,6 +931,31 @@ function clearAuditLog(agentId) {
     db2.prepare("DELETE FROM audit_log").run();
   }
 }
+function buildModel(config, apiKey) {
+  switch (config.provider) {
+    case "anthropic":
+      return anthropic.anthropic(config.model, { apiKey: apiKey ?? "" });
+    case "openai":
+      return openai.createOpenAI({ apiKey: apiKey ?? "", baseURL: config.baseUrl })(config.model);
+    case "gemini":
+      return openaiCompatible.createOpenAICompatible({
+        name: "gemini",
+        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+        apiKey: apiKey ?? ""
+      })(config.model);
+    case "ollama": {
+      const baseURL = (config.baseUrl ?? "http://localhost:11434").replace(/\/$/, "") + "/v1";
+      return openaiCompatible.createOpenAICompatible({ name: "ollama", baseURL })(config.model);
+    }
+    case "custom":
+      return openaiCompatible.createOpenAICompatible({
+        name: "custom",
+        baseURL: config.baseUrl,
+        apiKey: apiKey ?? void 0,
+        headers: config.headers
+      })(config.model);
+  }
+}
 function ok$1(data) {
   return { ok: true, data };
 }
@@ -925,7 +973,7 @@ function emitToRenderer(runId, event) {
 }
 function registerRunnerIpc() {
   electron.ipcMain.handle(IPC_CHANNELS.RUNNER_START, async (_event, payload) => {
-    const { agentId, userMessage, runId } = payload;
+    const { agentId, messages, runId } = payload;
     try {
       const agent = getAgent(agentId);
       if (!agent) return err$1("Agent not found");
@@ -934,6 +982,7 @@ function registerRunnerIpc() {
         abortController,
         confirmations: /* @__PURE__ */ new Map()
       });
+      const userMessage = messages[messages.length - 1]?.content ?? "";
       emitToRenderer(runId, {
         type: "run-started",
         runId,
@@ -949,7 +998,7 @@ function registerRunnerIpc() {
           payload: { userMessage: userMessage.slice(0, 200) }
         });
       }
-      runAgent({ agent, userMessage, runId, abortController, agentId }).catch((runErr) => {
+      runAgent({ agent, messages, runId, abortController, agentId }).catch((runErr) => {
         console.error(`[runner] Run ${runId} failed:`, runErr);
         emitToRenderer(runId, {
           type: "run-error",
@@ -982,44 +1031,78 @@ function registerRunnerIpc() {
   });
 }
 async function runAgent(params) {
-  const { agent, userMessage, runId, agentId, abortController } = params;
+  const { agent, messages, runId, agentId, abortController } = params;
   try {
     emitToRenderer(runId, {
       type: "node-started",
       runId,
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       nodeId: "node-llm",
-      data: { message: `Processing: ${userMessage}` }
+      data: {}
     });
-    if (abortController.signal.aborted) {
-      throw new Error("Run aborted by user");
+    let apiKey = null;
+    const providersWithoutKey = /* @__PURE__ */ new Set(["ollama"]);
+    if (!providersWithoutKey.has(agent.provider.provider)) {
+      const apiKeyRef = agent.provider.apiKeyRef ?? "";
+      if (apiKeyRef) {
+        apiKey = getSecret(apiKeyRef);
+      }
+      if (!apiKey) {
+        emitToRenderer(runId, {
+          type: "run-error",
+          runId,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          data: {
+            error: `No API key found for ${agent.provider.provider}. Please add it in Settings → API Keys.`
+          }
+        });
+        return;
+      }
     }
-    const responseText = `[Agent "${agent.name}" received your message. LLM integration coming in Phase 3.]
-
-Your message: ${userMessage}`;
-    for (const char of responseText) {
+    if (agent.auditEnabled) {
+      appendAuditLog({
+        agentId,
+        runId,
+        eventType: "llm-call",
+        outcome: "success",
+        payload: {
+          provider: agent.provider.provider,
+          model: agent.provider.model,
+          messageCount: messages.length
+        }
+      });
+    }
+    const model = buildModel(agent.provider, apiKey);
+    const result = ai.streamText({
+      model,
+      system: agent.systemPrompt || void 0,
+      messages,
+      maxTokens: agent.provider.maxTokens,
+      temperature: agent.provider.temperature,
+      abortSignal: abortController.signal
+    });
+    for await (const chunk of result.textStream) {
       if (abortController.signal.aborted) break;
       emitToRenderer(runId, {
         type: "llm-chunk",
         runId,
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         nodeId: "node-llm",
-        data: { chunk: char }
+        data: { chunk }
       });
-      await new Promise((r) => setTimeout(r, 10));
     }
     emitToRenderer(runId, {
       type: "node-completed",
       runId,
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       nodeId: "node-llm",
-      data: { outputVariable: "llmResponse", value: responseText }
+      data: {}
     });
     emitToRenderer(runId, {
       type: "run-completed",
       runId,
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-      data: { result: responseText }
+      data: {}
     });
     if (agent.auditEnabled) {
       appendAuditLog({
@@ -1027,6 +1110,24 @@ Your message: ${userMessage}`;
         runId,
         eventType: "run-completed",
         outcome: "success"
+      });
+    }
+  } catch (e) {
+    const error = e;
+    if (error.name === "AbortError" || abortController.signal.aborted) {
+      emitToRenderer(runId, {
+        type: "run-completed",
+        runId,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        data: {}
+      });
+    } else {
+      console.error("[runner] LLM error:", error);
+      emitToRenderer(runId, {
+        type: "run-error",
+        runId,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        data: { error: error.message || String(error) }
       });
     }
   } finally {

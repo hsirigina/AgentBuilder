@@ -9,13 +9,15 @@ import CreateAgentDialog from '../../components/CreateAgentDialog'
 const PROVIDER_COLORS: Record<string, string> = {
   anthropic: 'bg-orange-500/15 text-orange-400 border-orange-500/20',
   openai: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20',
+  gemini: 'bg-blue-500/15 text-blue-400 border-blue-500/20',
   ollama: 'bg-purple-500/15 text-purple-400 border-purple-500/20',
-  custom: 'bg-blue-500/15 text-blue-400 border-blue-500/20'
+  custom: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/20'
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Claude',
   openai: 'OpenAI',
+  gemini: 'Gemini',
   ollama: 'Ollama',
   custom: 'Custom'
 }

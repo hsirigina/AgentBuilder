@@ -1,8 +1,11 @@
 import { ipcMain, BrowserWindow } from 'electron'
+import { streamText } from 'ai'
 import { v4 as uuidv4 } from 'uuid'
 import { IPC_CHANNELS } from '@shared/types/ipc.types'
 import * as agentsRepo from '../storage/agents.repo'
 import { appendAuditLog } from '../storage/audit.repo'
+import { buildModel } from '../llm/index'
+import * as settingsRepo from '../storage/settings.repo'
 import type {
   IpcResponse,
   RunnerStartPayload,
@@ -36,7 +39,7 @@ function emitToRenderer(runId: string, event: RunnerEvent): void {
 
 export function registerRunnerIpc(): void {
   ipcMain.handle(IPC_CHANNELS.RUNNER_START, async (_event, payload: RunnerStartPayload) => {
-    const { agentId, userMessage, runId } = payload
+    const { agentId, messages, runId } = payload
 
     try {
       const agent = agentsRepo.getAgent(agentId)
@@ -48,7 +51,8 @@ export function registerRunnerIpc(): void {
         confirmations: new Map()
       })
 
-      // Emit run-started event immediately
+      const userMessage = messages[messages.length - 1]?.content ?? ''
+
       emitToRenderer(runId, {
         type: 'run-started',
         runId,
@@ -66,8 +70,8 @@ export function registerRunnerIpc(): void {
         })
       }
 
-      // Run agent asynchronously — don't await so we return immediately
-      runAgent({ agent, userMessage, runId, abortController, agentId }).catch((runErr) => {
+      // Run agent asynchronously — return immediately so UI isn't blocked
+      runAgent({ agent, messages, runId, abortController, agentId }).catch((runErr) => {
         console.error(`[runner] Run ${runId} failed:`, runErr)
         emitToRenderer(runId, {
           type: 'run-error',
@@ -107,47 +111,80 @@ export function registerRunnerIpc(): void {
 }
 
 // ── Agent execution engine ────────────────────────────────────────────────────
-// This is a placeholder that will be fully implemented in Phase 3.
-// For now it executes a simple linear flow.
 
 async function runAgent(params: {
   agent: import('@shared/schemas/agent.schema').AgentDefinition
-  userMessage: string
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
   runId: string
   agentId: string
   abortController: AbortController
 }): Promise<void> {
-  const { agent, userMessage, runId, agentId, abortController } = params
+  const { agent, messages, runId, agentId, abortController } = params
 
   try {
-    // Phase 3 will implement full graph traversal.
-    // For now, emit a placeholder run-completed event.
     emitToRenderer(runId, {
       type: 'node-started',
       runId,
       timestamp: new Date().toISOString(),
       nodeId: 'node-llm',
-      data: { message: `Processing: ${userMessage}` }
+      data: {}
     })
 
-    if (abortController.signal.aborted) {
-      throw new Error('Run aborted by user')
+    // Resolve API key (Ollama doesn't need one; all other providers do)
+    let apiKey: string | null = null
+    const providersWithoutKey = new Set(['ollama'])
+    if (!providersWithoutKey.has(agent.provider.provider)) {
+      const apiKeyRef = (agent.provider as { apiKeyRef?: string }).apiKeyRef ?? ''
+      if (apiKeyRef) {
+        apiKey = settingsRepo.getSecret(apiKeyRef)
+      }
+      if (!apiKey) {
+        emitToRenderer(runId, {
+          type: 'run-error',
+          runId,
+          timestamp: new Date().toISOString(),
+          data: {
+            error: `No API key found for ${agent.provider.provider}. Please add it in Settings → API Keys.`
+          }
+        })
+        return
+      }
     }
 
-    // Placeholder: echo the message back (real LLM integration in Phase 3)
-    const responseText = `[Agent "${agent.name}" received your message. LLM integration coming in Phase 3.]\n\nYour message: ${userMessage}`
+    if (agent.auditEnabled) {
+      appendAuditLog({
+        agentId,
+        runId,
+        eventType: 'llm-call',
+        outcome: 'success',
+        payload: {
+          provider: agent.provider.provider,
+          model: agent.provider.model,
+          messageCount: messages.length
+        }
+      })
+    }
 
-    // Stream the response character by character to demonstrate streaming
-    for (const char of responseText) {
+    const model = buildModel(agent.provider, apiKey)
+
+    const result = streamText({
+      model,
+      system: agent.systemPrompt || undefined,
+      messages,
+      maxTokens: agent.provider.maxTokens,
+      temperature: agent.provider.temperature,
+      abortSignal: abortController.signal
+    })
+
+    for await (const chunk of result.textStream) {
       if (abortController.signal.aborted) break
       emitToRenderer(runId, {
         type: 'llm-chunk',
         runId,
         timestamp: new Date().toISOString(),
         nodeId: 'node-llm',
-        data: { chunk: char }
+        data: { chunk }
       })
-      await new Promise((r) => setTimeout(r, 10))
     }
 
     emitToRenderer(runId, {
@@ -155,14 +192,14 @@ async function runAgent(params: {
       runId,
       timestamp: new Date().toISOString(),
       nodeId: 'node-llm',
-      data: { outputVariable: 'llmResponse', value: responseText }
+      data: {}
     })
 
     emitToRenderer(runId, {
       type: 'run-completed',
       runId,
       timestamp: new Date().toISOString(),
-      data: { result: responseText }
+      data: {}
     })
 
     if (agent.auditEnabled) {
@@ -171,6 +208,25 @@ async function runAgent(params: {
         runId,
         eventType: 'run-completed',
         outcome: 'success'
+      })
+    }
+  } catch (e) {
+    const error = e as Error
+    if (error.name === 'AbortError' || abortController.signal.aborted) {
+      // Clean stop — emit run-completed so the UI unlocks
+      emitToRenderer(runId, {
+        type: 'run-completed',
+        runId,
+        timestamp: new Date().toISOString(),
+        data: {}
+      })
+    } else {
+      console.error('[runner] LLM error:', error)
+      emitToRenderer(runId, {
+        type: 'run-error',
+        runId,
+        timestamp: new Date().toISOString(),
+        data: { error: error.message || String(error) }
       })
     }
   } finally {

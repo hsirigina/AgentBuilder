@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 import { v4 as uuidv4 } from 'uuid'
-import type { RunnerEvent, ConfirmationRequest } from '@shared/types/ipc.types'
+import type { RunnerEvent, ConfirmationRequest, ChatMessage } from '@shared/types/ipc.types'
 import { ipc, ipcCall } from '../lib/ipc-client'
 
 export interface ConsoleEntry {
@@ -16,11 +16,13 @@ interface RunnerState {
   runId: string | null
   isRunning: boolean
   activeNodeId: string | null
-  completedNodeIds: Set<string>
-  errorNodeIds: Set<string>
+  // Plain arrays instead of Set — avoids needing Immer's MapSet plugin
+  completedNodeIds: string[]
+  errorNodeIds: string[]
   consoleEntries: ConsoleEntry[]
   pendingConfirmation: ConfirmationRequest | null
-  streamingText: string
+  // ID of the currently-streaming assistant entry so we can find and update it
+  streamingEntryId: string | null
 
   // Actions
   startRun: (agentId: string, userMessage: string) => Promise<void>
@@ -35,11 +37,11 @@ export const useRunnerStore = create<RunnerState>()(
     runId: null,
     isRunning: false,
     activeNodeId: null,
-    completedNodeIds: new Set(),
-    errorNodeIds: new Set(),
+    completedNodeIds: [],
+    errorNodeIds: [],
     consoleEntries: [],
     pendingConfirmation: null,
-    streamingText: '',
+    streamingEntryId: null,
 
     startRun: async (agentId: string, userMessage: string) => {
       const runId = uuidv4()
@@ -48,9 +50,9 @@ export const useRunnerStore = create<RunnerState>()(
         s.runId = runId
         s.isRunning = true
         s.activeNodeId = null
-        s.completedNodeIds = new Set()
-        s.errorNodeIds = new Set()
-        s.streamingText = ''
+        s.completedNodeIds = []
+        s.errorNodeIds = []
+        s.streamingEntryId = null
         s.pendingConfirmation = null
         s.consoleEntries.push({
           id: uuidv4(),
@@ -60,7 +62,25 @@ export const useRunnerStore = create<RunnerState>()(
         })
       })
 
-      await ipcCall(ipc.runner.start({ agentId, userMessage, runId }))
+      // Build conversation history from all user/assistant entries (includes the new user message)
+      const { consoleEntries } = get()
+      const messages: ChatMessage[] = consoleEntries
+        .filter((e) => e.type === 'user' || e.type === 'assistant')
+        .map((e) => ({ role: e.type as 'user' | 'assistant', content: e.content }))
+
+      try {
+        await ipcCall(ipc.runner.start({ agentId, messages, runId }))
+      } catch (e) {
+        set((s) => {
+          s.isRunning = false
+          s.consoleEntries.push({
+            id: uuidv4(),
+            timestamp: new Date().toISOString(),
+            type: 'error',
+            content: `Failed to start: ${String(e)}`
+          })
+        })
+      }
     },
 
     stopRun: async () => {
@@ -70,12 +90,13 @@ export const useRunnerStore = create<RunnerState>()(
       try {
         await ipcCall(ipc.runner.stop(runId))
       } catch {
-        // Ignore errors when stopping
+        // Ignore stop errors
       }
 
       set((s) => {
         s.isRunning = false
         s.activeNodeId = null
+        s.streamingEntryId = null
         s.consoleEntries.push({
           id: uuidv4(),
           timestamp: new Date().toISOString(),
@@ -88,24 +109,33 @@ export const useRunnerStore = create<RunnerState>()(
     handleEvent: (event: RunnerEvent) => {
       set((s) => {
         switch (event.type) {
+          case 'run-started':
+            s.consoleEntries.push({
+              id: uuidv4(),
+              timestamp: event.timestamp,
+              type: 'system',
+              content: 'Agent running...'
+            })
+            break
+
           case 'node-started':
             s.activeNodeId = event.nodeId ?? null
             break
 
           case 'node-completed':
-            if (event.nodeId) {
-              s.completedNodeIds.add(event.nodeId)
-              if (s.activeNodeId === event.nodeId) {
-                s.activeNodeId = null
-              }
+            if (event.nodeId && !s.completedNodeIds.includes(event.nodeId)) {
+              s.completedNodeIds.push(event.nodeId)
+            }
+            if (s.activeNodeId === event.nodeId) {
+              s.activeNodeId = null
             }
             break
 
           case 'node-error':
-            if (event.nodeId) {
-              s.errorNodeIds.add(event.nodeId)
-              s.activeNodeId = null
+            if (event.nodeId && !s.errorNodeIds.includes(event.nodeId)) {
+              s.errorNodeIds.push(event.nodeId)
             }
+            s.activeNodeId = null
             s.consoleEntries.push({
               id: uuidv4(),
               timestamp: event.timestamp,
@@ -117,20 +147,26 @@ export const useRunnerStore = create<RunnerState>()(
 
           case 'llm-chunk': {
             const chunk = (event.data as { chunk: string }).chunk
-            s.streamingText += chunk
-            // Update or add the streaming assistant entry
-            const lastEntry = s.consoleEntries[s.consoleEntries.length - 1]
-            if (lastEntry?.type === 'assistant' && lastEntry.nodeId === event.nodeId) {
-              lastEntry.content = s.streamingText
-            } else {
-              s.consoleEntries.push({
-                id: uuidv4(),
-                timestamp: event.timestamp,
-                type: 'assistant',
-                content: s.streamingText,
-                nodeId: event.nodeId
-              })
+
+            if (s.streamingEntryId) {
+              // Find the existing streaming entry and append to it
+              const idx = s.consoleEntries.findIndex((e) => e.id === s.streamingEntryId)
+              if (idx >= 0) {
+                s.consoleEntries[idx].content = s.consoleEntries[idx].content + chunk
+                break
+              }
             }
+
+            // No streaming entry yet — create one
+            const entryId = uuidv4()
+            s.streamingEntryId = entryId
+            s.consoleEntries.push({
+              id: entryId,
+              timestamp: event.timestamp,
+              type: 'assistant',
+              content: chunk,
+              nodeId: event.nodeId
+            })
             break
           }
 
@@ -160,18 +196,19 @@ export const useRunnerStore = create<RunnerState>()(
           case 'run-completed':
             s.isRunning = false
             s.activeNodeId = null
-            s.streamingText = ''
+            s.streamingEntryId = null
             break
 
           case 'run-error': {
             const errorData = event.data as { error: string }
             s.isRunning = false
             s.activeNodeId = null
+            s.streamingEntryId = null
             s.consoleEntries.push({
               id: uuidv4(),
               timestamp: event.timestamp,
               type: 'error',
-              content: `Run failed: ${errorData.error}`
+              content: `Error: ${errorData.error}`
             })
             break
           }
@@ -205,7 +242,7 @@ export const useRunnerStore = create<RunnerState>()(
     clearConsole: () => {
       set((s) => {
         s.consoleEntries = []
-        s.streamingText = ''
+        s.streamingEntryId = null
       })
     }
   }))

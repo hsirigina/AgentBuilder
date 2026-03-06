@@ -11,7 +11,8 @@ import type {
   AuditQueryPayload,
   AuditQueryResponse,
   RunnerEvent,
-  RunnerConfirmPayload
+  RunnerConfirmPayload,
+  ChatMessage
 } from '../shared/types/ipc.types'
 import type { AgentDefinition } from '../shared/schemas/agent.schema'
 
@@ -50,7 +51,7 @@ const api = {
   runner: {
     start: (payload: {
       agentId: string
-      userMessage: string
+      messages: ChatMessage[]
       runId: string
     }): Promise<IpcResponse<{ runId: string; started: boolean }>> =>
       invoke(IPC_CHANNELS.RUNNER_START, payload),

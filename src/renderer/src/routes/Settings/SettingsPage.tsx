@@ -96,6 +96,15 @@ const PROVIDER_KEYS: ProviderKeyConfig[] = [
     testModel: 'gpt-4o-mini',
     placeholder: 'sk-...',
     docsUrl: 'https://platform.openai.com/api-keys'
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    secretKey: 'gemini_api_key',
+    testProvider: 'gemini',
+    testModel: 'gemini-1.5-flash',
+    placeholder: 'AIza...',
+    docsUrl: 'https://aistudio.google.com/app/apikey'
   }
 ]
 

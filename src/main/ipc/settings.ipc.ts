@@ -123,6 +123,17 @@ export function registerSettingsIpc(): void {
               error: `HTTP ${response.status}`
             })
           }
+        } else if (payload.provider === 'gemini') {
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+          )
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}))
+            return ok<ProviderTestResponse>({
+              success: false,
+              error: (body as { error?: { message?: string } }).error?.message || `HTTP ${response.status}`
+            })
+          }
         } else if (payload.provider === 'ollama') {
           const response = await fetch('http://localhost:11434/api/tags').catch(
             () => null
